@@ -33,10 +33,12 @@ public:
         : clientSocket_(io_service)
         , strand_(io_service)
         , parentSession_(session)
-        , socketBuffer_(4096)
-        , sshBuffer_(4096)
+        , clientInBuffer_(4096)
+        , sshOutBuffer_()
+        , sshInBuffer_(4096)
+        , writing2Client_()
     {
-        session_.optionsCopy(session);
+        session_.optionsCopy(session); 
     }
 
     ~IncomingConnection()
@@ -71,6 +73,7 @@ public:
             const auto cmd = std::string("socat - TCP4:localhost:") + std::to_string(port);
             channel_->requestExec(cmd.c_str());
 
+            startClientRead();
             worker_ = std::thread(std::bind(&IncomingConnection::worker, this));
         }
         catch (ssh::SshException& e)
@@ -81,51 +84,74 @@ public:
 
 private:
 
-    void worker()
+    void startClientRead()
     {
         const auto instance(shared_from_this());
 
-        while (clientSocket_.is_open())
-            processSockets();
-    }
-
-    void readFromClient()
-    {
-        try
+        clientSocket_.async_read_some(boost::asio::buffer(clientInBuffer_), strand_.wrap(
+            [instance, this](boost::system::error_code e, std::size_t bytes)
         {
-            if (!clientSocket_.available())
-                return; 
-
-            auto bytes = clientSocket_.read_some(boost::asio::buffer(socketBuffer_));
-
-            int written = 0;
-            while (bytes)
+            if (e)
             {
-                const auto res = channel_->write(socketBuffer_.data() + written, bytes);
-                written += res;
-                bytes -= res;
+                clientSocket_.close();
+                return;
             }
-        }
-        catch (ssh::SshException e)
-        {
-            std::cerr << "Failed to write to ssh: " << e.getError() << std::endl;
-            clientSocket_.close();
-        }
-        catch (const std::exception& e)
-        {
-            std::cerr << "Failed to read from client: " << e.what() << std::endl;
-            clientSocket_.close();
-        }
 
+            {
+                std::unique_lock<std::mutex> lock(outMutex_);
+
+                if (sshOutBuffer_.capacity() < sshOutBuffer_.size() + bytes)
+                    sshOutBuffer_.reserve(sshOutBuffer_.capacity() + bytes);
+
+                std::copy(clientInBuffer_.begin(), clientInBuffer_.begin() + bytes, std::back_inserter(sshOutBuffer_));
+            }
+
+            startClientRead();
+        }));
     }
 
-    void readFromSsh()
+    void worker()
+    {
+        while (clientSocket_.is_open())
+        {
+            if (!processSockets())
+                std::this_thread::sleep_for(std::chrono::microseconds(1));
+        }
+    }
+
+    bool processSockets()
     {
         try
         {
-            const auto read = channel_->readNonblocking(sshBuffer_.data(), sshBuffer_.size());
+            const auto read = channel_->readNonblocking(sshInBuffer_.data(), sshInBuffer_.size());
             if (read)
-                boost::asio::write(clientSocket_, boost::asio::buffer(sshBuffer_.data(), read), boost::asio::transfer_all());
+            {
+                {
+                    std::unique_lock<std::mutex> lock(inMutex_);
+                    std::copy(sshInBuffer_.begin(), sshInBuffer_.begin() + read, std::back_inserter(clientOutBuffer_));
+                }
+                startWrite2Client();
+            }
+
+            std::vector<char> local;
+            {
+                std::unique_lock<std::mutex> lock(outMutex_);
+                if (sshOutBuffer_.empty())
+                    return !!read;
+
+                local.swap(sshOutBuffer_);
+
+                auto bytes = local.size();
+                int written = 0;
+                while (bytes)
+                {
+                    const auto res = channel_->write(local.data() + written, bytes);
+                    written += res;
+                    bytes -= res;
+                }
+            }
+
+            return true;
         }
         catch (ssh::SshException e)
         {
@@ -137,37 +163,34 @@ private:
             std::cerr << "Failed to write to client: " << e.what() << std::endl;
             clientSocket_.close();
         }
+
     }
 
-    void processSockets()
+    void startWrite2Client()
     {
-        const int ssh = session_.getSocket();
-        const int client = clientSocket_.native_handle();
+        std::unique_lock<std::mutex> lock(inMutex_);
 
-        fd_set readset;
+        if (writing2Client_ || clientOutBuffer_.empty())
+            return;
 
-        timeval timeout = {};
-        timeout.tv_usec = 100;
+        writing2Client_ = true;
+        const auto buffer = boost::make_shared<std::vector<char>>();
 
-        FD_ZERO(&readset);
-        FD_SET(ssh, &readset);
-        FD_SET(client, &readset);
+        buffer->swap(clientOutBuffer_);
 
-        int smax = max(ssh, client);
-
-        int result = select(smax + 1, &readset, NULL, NULL, &timeout);
-        if (result > 0)
+        const auto instance(shared_from_this());
+        boost::asio::async_write(clientSocket_, boost::asio::buffer(*buffer), boost::asio::transfer_all(), 
+            [buffer, this, instance](boost::system::error_code e, std::size_t bytes)
         {
-            if (FD_ISSET(ssh, &readset))
-                readFromSsh();
-            if (FD_ISSET(client, &readset))
-                readFromClient();
-        }
-        else
-        if (result < 0)
-        {
-            clientSocket_.close();
-        }
+            assert(bytes == buffer->size());
+
+            {
+                std::unique_lock<std::mutex> lock(inMutex_);
+                writing2Client_ = false;
+            }
+
+            startWrite2Client();
+        });
     }
 
     boost::asio::ip::tcp::socket clientSocket_;
@@ -177,8 +200,15 @@ private:
     ssh::Session session_;
     std::unique_ptr<ssh::Channel> channel_;
     std::thread worker_;
-    std::vector<char> socketBuffer_;
-    std::vector<char> sshBuffer_;
+    std::vector<char> clientInBuffer_;
+    std::vector<char> clientOutBuffer_;
+    std::vector<char> sshOutBuffer_;
+    std::vector<char> sshInBuffer_;
+
+    std::mutex outMutex_;
+    std::mutex inMutex_;
+
+    bool writing2Client_;
 };
 
 
