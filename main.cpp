@@ -30,104 +30,155 @@ public:
 
     IncomingConnection(boost::asio::io_service& io_service, 
                        ssh::Session& session)
-        : socket_(io_service)
-        , channel_(session)
+        : clientSocket_(io_service)
+        , strand_(io_service)
+        , parentSession_(session)
         , socketBuffer_(4096)
+        , sshBuffer_(4096)
     {
+        session_.optionsCopy(session);
     }
 
     ~IncomingConnection()
     {
-        channel_.getSession().log(SSH_LOG_WARNING, "Terminating connection");
+        parentSession_.log(SSH_LOG_WARNING, "Terminating connection");
 
-        socket_.close();
+        clientSocket_.close();
 
-        if (sshReader_.joinable())
-            sshReader_.join();
+        if (worker_.joinable())
+            worker_.join();
     }
 
     boost::asio::ip::tcp::socket& socket()
     {
-        return socket_;
+        return clientSocket_;
     }
 
-    void start(short port)
+    void start(short port, const std::string& password)
     {
-        channel_.getSession().log(SSH_LOG_WARNING, "Starting connection to remote port: %d", port);
+        parentSession_.log(SSH_LOG_WARNING, "Starting connection to remote port: %d", port);
 
         try
         {
-            channel_.openSession();
+            session_.connect();
+            int r = session_.userauthPassword(password.c_str());
+            if (r != SSH_AUTH_SUCCESS)
+                throw std::runtime_error("auth failed");
+
+            channel_ = std::make_unique<ssh::Channel>(session_);
+            channel_->openSession();
 
             const auto cmd = std::string("socat - TCP4:localhost:") + std::to_string(port);
-            channel_.requestExec(cmd.c_str());
+            channel_->requestExec(cmd.c_str());
+
+            worker_ = std::thread(std::bind(&IncomingConnection::worker, this));
         }
         catch (ssh::SshException& e)
         {
             std::cerr << "Failed to launch socat: " << e.getError() << std::endl;
         }
-
-        sshReader_ = std::thread(std::bind(&IncomingConnection::sshReader, this));
-        startSocketRead();
     }
 
 private:
 
-    void startSocketRead()
+    void worker()
     {
         const auto instance(shared_from_this());
-        socket_.async_read_some(boost::asio::buffer(socketBuffer_), [instance, this](boost::system::error_code e, std::size_t bytes)
+
+        while (clientSocket_.is_open())
+            processSockets();
+    }
+
+    void readFromClient()
+    {
+        try
         {
-            if (e)
-            {
-                socket_.close();
-                return;
-            }
+            if (!clientSocket_.available())
+                return; 
+
+            auto bytes = clientSocket_.read_some(boost::asio::buffer(socketBuffer_));
 
             int written = 0;
             while (bytes)
             {
-                const auto res = channel_.write(socketBuffer_.data() + written, bytes);
+                const auto res = channel_->write(socketBuffer_.data() + written, bytes);
                 written += res;
                 bytes -= res;
             }
+        }
+        catch (ssh::SshException e)
+        {
+            std::cerr << "Failed to write to ssh: " << e.getError() << std::endl;
+            clientSocket_.close();
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "Failed to read from client: " << e.what() << std::endl;
+            clientSocket_.close();
+        }
 
-            startSocketRead();
-        });
     }
 
-    void sshReader()
+    void readFromSsh()
     {
-        std::vector<char> buffer;
-
-        for (; socket_.is_open();)
+        try
         {
-            try
-            {
-                const auto bytes = channel_.poll();
-                if (!bytes)
-                {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                    continue;
-                }
-
-                buffer.resize(bytes);
-                const auto read = channel_.read(buffer.data(), buffer.size());
-
-                boost::asio::write(socket_, boost::asio::buffer(buffer), boost::asio::transfer_all());
-            }
-            catch (const std::exception& e)
-            {
-                std::cerr << "Exception in read thread: " << e.what() << std::endl;
-                socket_.close();
-            }
+            const auto read = channel_->readNonblocking(sshBuffer_.data(), sshBuffer_.size());
+            if (read)
+                boost::asio::write(clientSocket_, boost::asio::buffer(sshBuffer_.data(), read), boost::asio::transfer_all());
+        }
+        catch (ssh::SshException e)
+        {
+            std::cerr << "Failed to read from ssh: " << e.getError() << std::endl;
+            clientSocket_.close();
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "Failed to write to client: " << e.what() << std::endl;
+            clientSocket_.close();
         }
     }
 
-    boost::asio::ip::tcp::socket socket_;
-    ssh::Channel channel_;
-    std::thread sshReader_;
+    void processSockets()
+    {
+        const int ssh = session_.getSocket();
+        const int client = clientSocket_.native_handle();
+
+        fd_set readset;
+
+        timeval timeout = {};
+        timeout.tv_usec = 100;
+
+        FD_ZERO(&readset);
+        FD_SET(ssh, &readset);
+        FD_SET(client, &readset);
+
+        int smax = max(ssh, client);
+
+        int result = select(smax + 1, &readset, NULL, NULL, &timeout);
+        if (result > 0)
+        {
+            if (FD_ISSET(ssh, &readset))
+                readFromSsh();
+            if (FD_ISSET(client, &readset))
+                readFromClient();
+        }
+        else
+        if (result < 0)
+        {
+            clientSocket_.close();
+        }
+    }
+
+    boost::asio::ip::tcp::socket clientSocket_;
+    ssh::Session& parentSession_;
+    boost::asio::io_service::strand strand_;
+
+    ssh::Session session_;
+    std::unique_ptr<ssh::Channel> channel_;
+    std::thread worker_;
     std::vector<char> socketBuffer_;
+    std::vector<char> sshBuffer_;
 };
 
 
@@ -143,6 +194,7 @@ public:
            short forwardToPort) 
         : acceptor_(svc, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), listeningPort))
         , port_(forwardToPort)
+        , password_(password)
     {
         session_.setOption(SSH_OPTIONS_HOST, host.c_str());
         session_.setOption(SSH_OPTIONS_USER, user.c_str());
@@ -170,7 +222,7 @@ public:
     void handleAccept(IncomingConnection::Ptr connection, const boost::system::error_code& error)
     {
         if (!error)
-            connection->start(port_);
+            connection->start(port_, password_);
 
         start();
     }
@@ -179,6 +231,7 @@ private:
     boost::asio::ip::tcp::acceptor acceptor_;
     ssh::Session session_;
     const short port_;
+    const std::string password_;
 };
 
 
@@ -199,24 +252,10 @@ void init(bool debug)
     ssh_init();
 }
 
-void setStdInEcho(bool enable = true)
-{
-    HANDLE hStdin = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD mode;
-    GetConsoleMode(hStdin, &mode);
-
-    if (!enable)
-        mode &= ~ENABLE_ECHO_INPUT;
-    else
-        mode |= ENABLE_ECHO_INPUT;
-
-    SetConsoleMode(hStdin, mode);
-}
-
 int main(int argc, const char **argv) 
 {
-    char buf[UNLEN + 1];
-    DWORD username_len = UNLEN + 1;
+    char buf[4096];
+    DWORD username_len = sizeof(buf);
     GetUserName(buf, &username_len);
 
     std::string userName(buf);
@@ -245,13 +284,10 @@ int main(int argc, const char **argv)
 
     userName = vm["user"].as<std::string>();
 
-    std::cout << "Enter password for [" << userName << "]:" << std::endl;
+    strncpy(buf, userName.c_str(), sizeof(buf));
+    ssh_getpass("Password: ", buf, sizeof(buf), 0, 0);
 
-    std::string password;
-
-    setStdInEcho(false);
-    std::cin >> password;
-    setStdInEcho(true);
+    std::string password = buf;
     
     try 
     {
