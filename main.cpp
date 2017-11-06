@@ -70,6 +70,35 @@ public:
             channel_ = std::make_unique<ssh::Channel>(session_);
             channel_->openSession();
 
+            std::cout << "Trying to read from remote side..." << std::endl;
+
+            char buffer[4096] = {};;
+            auto read = channel_->read(buffer, sizeof(buffer), 5000);
+            if (read)
+            {
+                std::cout.write(buffer, read);
+                std::cout << std::endl;
+                std::cout << "Expecting user input: " << std::endl;
+
+                std::string input;
+                std::cin >> input;
+
+                channel_->write(input.c_str(), input.size());
+
+                std::cout << "Trying to read from remote side..." << std::endl;
+                read = channel_->read(buffer, sizeof(buffer), 5000);
+
+                if (read)
+                {
+                    std::cout.write(buffer, read);
+                    std::cout << std::endl;
+                }
+            }
+            else
+            {
+                std::cout << "Unable to read, starting forwarding through socat" << std::endl;
+            }
+
             const auto cmd = std::string("socat - TCP4:localhost:") + std::to_string(port);
             channel_->requestExec(cmd.c_str());
 
