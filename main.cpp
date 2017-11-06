@@ -70,35 +70,6 @@ public:
             channel_ = std::make_unique<ssh::Channel>(session_);
             channel_->openSession();
 
-            std::cout << "Trying to read from remote side..." << std::endl;
-
-            char buffer[4096] = {};;
-            auto read = channel_->read(buffer, sizeof(buffer), 5000);
-            if (read)
-            {
-                std::cout.write(buffer, read);
-                std::cout << std::endl;
-                std::cout << "Expecting user input: " << std::endl;
-
-                std::string input;
-                std::cin >> input;
-
-                channel_->write(input.c_str(), input.size());
-
-                std::cout << "Trying to read from remote side..." << std::endl;
-                read = channel_->read(buffer, sizeof(buffer), 5000);
-
-                if (read)
-                {
-                    std::cout.write(buffer, read);
-                    std::cout << std::endl;
-                }
-            }
-            else
-            {
-                std::cout << "Unable to read, starting forwarding through socat" << std::endl;
-            }
-
             const auto cmd = std::string("socat - TCP4:localhost:") + std::to_string(port);
             channel_->requestExec(cmd.c_str());
 
@@ -192,7 +163,7 @@ private:
             std::cerr << "Failed to write to client: " << e.what() << std::endl;
             clientSocket_.close();
         }
-
+        return false;
     }
 
     void startWrite2Client()
@@ -250,7 +221,8 @@ public:
            const std::string& user,
            const std::string& password,
            short sshServerPort,
-           short forwardToPort) 
+           short forwardToPort,
+           const std::string& proxy) 
         : acceptor_(svc, boost::asio::ip::tcp::endpoint(boost::asio::ip::tcp::v4(), listeningPort))
         , port_(forwardToPort)
         , password_(password)
@@ -258,6 +230,8 @@ public:
         session_.setOption(SSH_OPTIONS_HOST, host.c_str());
         session_.setOption(SSH_OPTIONS_USER, user.c_str());
         session_.setOption(SSH_OPTIONS_PORT, sshServerPort);
+        if (!proxy.empty())
+            session_.setOption(SSH_OPTIONS_PROXYCOMMAND, proxy.c_str());
 
         session_.connect();
         int r = session_.userauthPassword(password.c_str());
@@ -329,6 +303,7 @@ int main(int argc, const char **argv)
         ("port,P", po::value<short>()->default_value(22), "target port on remote machine to forward to")
         ("listen,L", po::value<short>()->default_value(22), "listening port on this machine")
         ("debug", po::bool_switch()->default_value(false), "enable debug logging")
+        ("proxy,X", po::value<std::string>()->default_value(""), "ssh proxy command")
         ;
     
     po::variables_map vm;
@@ -360,7 +335,8 @@ int main(int argc, const char **argv)
             userName,
             password,
             vm["srv-port"].as<short>(),
-            vm["port"].as<short>());
+            vm["port"].as<short>(),
+            vm["proxy"].as<std::string>());
 
         std::string().swap(password);
 
