@@ -1,3 +1,6 @@
 [submodule "libssh"]
 	path = libssh
 	url = https://git.libssh.org/projects/libssh.git
+[submodule "file-sync/dir_monitor"]
+	path = file-sync/dir_monitor
+	url = https://github.com/CLRN/dir_monitor.git
